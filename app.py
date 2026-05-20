@@ -33,26 +33,34 @@ from PIL import Image
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-from models import SimpleCNN
+from models import SimpleCNN, MediumCNN
 
 app = Flask(__name__)
 CORS(app)
 
 # ── 路径配置 ────────────────────────────────────────────────────
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'best_model.pth')
+BASE_DIR = os.path.dirname(__file__)
+MODEL_SIMPLE_PATH = os.path.join(BASE_DIR, 'best_model.pth')
+MODEL_MEDIUM_PATH = os.path.join(BASE_DIR, 'best_model_medium.pth')
 HAAR_CASCADE = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 
 # ── FER+ 8类标签映射 ───────────────────────────────────────────
-# ImageFolder 子文件夹按文件名排序：0=neutral, 1=happy, ...
-# 前端 labelMap 顺序：neutral, happy, surprise, fear, disgust, anger, contempt, sad
 CLASS_LABELS = ['neutral', 'happy', 'surprise', 'fear', 'disgust', 'anger', 'contempt', 'sad']
 
-# ── 加载模型 ────────────────────────────────────────────────────
-print("[*] Loading your trained CNN model...")
-model = SimpleCNN(num_classes=8)
-model.load_state_dict(torch.load(MODEL_PATH, map_location='cpu', weights_only=True))
-model.eval()
-print("[OK] Model loaded:", MODEL_PATH)
+# ── 双模型加载 ──────────────────────────────────────────────────
+models = {}
+
+print("[*] Loading SimpleCNN...")
+models['simple'] = SimpleCNN(num_classes=8)
+models['simple'].load_state_dict(torch.load(MODEL_SIMPLE_PATH, map_location='cpu', weights_only=True))
+models['simple'].eval()
+print("[OK] SimpleCNN loaded:", MODEL_SIMPLE_PATH)
+
+print("[*] Loading MediumCNN...")
+models['medium'] = MediumCNN(num_classes=8)
+models['medium'].load_state_dict(torch.load(MODEL_MEDIUM_PATH, map_location='cpu', weights_only=True))
+models['medium'].eval()
+print("[OK] MediumCNN loaded:", MODEL_MEDIUM_PATH)
 
 # ── 人脸检测器 ──────────────────────────────────────────────────
 face_cascade = cv2.CascadeClassifier(HAAR_CASCADE)
@@ -131,13 +139,18 @@ def predict():
     if 'image' not in request.files:
         return jsonify({'error': 'No image field named "image"'}), 400
 
+    # 读取模型选择参数，默认用 SimpleCNN
+    model_name = request.form.get('model', 'simple')
+    if model_name not in models:
+        model_name = 'simple'
+    selected_model = models[model_name]
+
     try:
         raw_bytes = request.files['image'].read()
-        print(f"[Debug] 收到图片大小: {len(raw_bytes)/1024:.1f} KB")
+        print(f"[Debug] 收到图片大小: {len(raw_bytes)/1024:.1f} KB, 模型: {model_name}")
         pil_img = Image.open(io.BytesIO(raw_bytes))
         pil_img = pil_img.convert('RGB')
         orig_w, orig_h = pil_img.size
-        # 大图先缩小到最长边 800px，加快处理速度，避免超时
         max_side = 800
         if max(pil_img.size) > max_side:
             ratio = max_side / max(pil_img.size)
@@ -152,21 +165,21 @@ def predict():
     tensor, face_detected = preprocess_image(cv_img)
 
     with torch.no_grad():
-        logits = model(tensor)
+        logits = selected_model(tensor)
         probs = torch.softmax(logits, dim=1).squeeze().tolist()
 
     all_scores = {CLASS_LABELS[i]: round(float(probs[i]), 4) for i in range(8)}
     best_label = CLASS_LABELS[int(np.argmax(probs))]
     confidence = float(max(probs))
 
-    print(f"[Predict] {best_label} ({confidence:.2%}) | face={face_detected}")
-    print(f"[Predict] all_scores: { {k: f'{v:.3f}' for k,v in all_scores.items()} }")
+    print(f"[Predict] [{model_name}] {best_label} ({confidence:.2%}) | face={face_detected}")
 
     return jsonify({
         'emotion': best_label,
         'confidence': round(confidence, 4),
         'all_scores': all_scores,
         'face_detected': face_detected,
+        'model': model_name,
         'is_mock': False
     })
 
