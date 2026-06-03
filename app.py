@@ -1,24 +1,19 @@
 """
-情绪识别后端 —— 接入你的真实 CNN 模型
+情绪识别后端 v2 —— 三模型切换 + 情绪日记
 ==========================================
-模型：SimpleCNN，训练自 FER2013Train 数据（8类）
-权重：best_model.pth（已从微信文件夹复制到本目录）
+模型：SimpleCNN / MediumCNN / AdvancedCNN
+日记：SQLite 本地存储，REST API
 
-模型输入：48x48 灰度图，归一化 mean=0.5, std=0.5
-输出：8类情绪概率（对应 FER+ 标签）
-
-运行：
-  C:\\Users\\26390\\.workbuddy\\binaries\\python\\envs\\emotion\\Scripts\\python.exe app.py
-
-接口：POST /predict
-  - multipart/form-data，字段名 image
-  - 返回：{ emotion, confidence, all_scores, face_detected }
+接口：
+  POST /predict        — 情绪识别（支持 model 参数：simple|medium|advanced）
+  POST /diary/save     — 保存日记 { user_id, emotion, confidence, all_scores, note }
+  GET  /diary/list     — 查询记录 ?user_id=xxx&year=2026&month=6
+  GET  /diary/weekly   — 本周报告 ?user_id=xxx
+  GET  /health         — 健康检查
 """
 
-import os
-import io
-import warnings
-import logging
+import os, io, sqlite3, json, warnings, logging
+from datetime import datetime, timedelta
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -26,168 +21,221 @@ warnings.filterwarnings('ignore')
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 
 import numpy as np
-import cv2
-import torch
-import torch.nn as nn
+import cv2, torch
 from PIL import Image
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
-from models import SimpleCNN, MediumCNN
+from models import SimpleCNN, MediumCNN, AdvancedCNN
 
 app = Flask(__name__)
 CORS(app)
 
 # ── 路径配置 ────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(__file__)
-MODEL_SIMPLE_PATH = os.path.join(BASE_DIR, 'best_model.pth')
-MODEL_MEDIUM_PATH = os.path.join(BASE_DIR, 'best_model_medium.pth')
+DB_PATH = os.path.join(BASE_DIR, 'emotion_diary.db')
 HAAR_CASCADE = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 
-# ── FER+ 8类标签映射 ───────────────────────────────────────────
+# ── 标签映射 ────────────────────────────────────────────────────
 CLASS_LABELS = ['neutral', 'happy', 'surprise', 'fear', 'disgust', 'anger', 'contempt', 'sad']
 
-# ── 双模型加载 ──────────────────────────────────────────────────
+# ── 三模型加载 ──────────────────────────────────────────────────
 models = {}
 
-print("[*] Loading SimpleCNN...")
-models['simple'] = SimpleCNN(num_classes=8)
-models['simple'].load_state_dict(torch.load(MODEL_SIMPLE_PATH, map_location='cpu', weights_only=True))
-models['simple'].eval()
-print("[OK] SimpleCNN loaded:", MODEL_SIMPLE_PATH)
+for arch, cls, fname in [
+    ('simple', SimpleCNN, 'best_model.pth'),
+    ('medium', MediumCNN, 'best_model_medium.pth'),
+    ('advanced', AdvancedCNN, 'best_model_advanced.pth')
+]:
+    path = os.path.join(BASE_DIR, fname)
+    print(f"[*] Loading {arch}...")
+    models[arch] = cls(num_classes=8)
+    models[arch].load_state_dict(torch.load(path, map_location='cpu', weights_only=True))
+    models[arch].eval()
+    print(f"[OK] {arch} loaded")
 
-print("[*] Loading MediumCNN...")
-models['medium'] = MediumCNN(num_classes=8)
-models['medium'].load_state_dict(torch.load(MODEL_MEDIUM_PATH, map_location='cpu', weights_only=True))
-models['medium'].eval()
-print("[OK] MediumCNN loaded:", MODEL_MEDIUM_PATH)
-
-# ── 人脸检测器 ──────────────────────────────────────────────────
 face_cascade = cv2.CascadeClassifier(HAAR_CASCADE)
 print("[OK] Face detector ready")
 
+# ── 数据库初始化 ─────────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('''CREATE TABLE IF NOT EXISTS diary (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        date TEXT NOT NULL,
+        emotion TEXT NOT NULL,
+        confidence REAL,
+        all_scores TEXT,
+        note TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, date)
+    )''')
+    conn.commit()
+    conn.close()
 
+def get_db():
+    if 'db' not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop('db', None)
+    if db: db.close()
+
+init_db()
+print("[OK] SQLite diary database ready")
+
+# ── 图像预处理 ──────────────────────────────────────────────────
 def preprocess_image(cv_img):
-    """
-    人脸检测 → 裁剪 → 缩放 48x48 → 灰度 → 归一化
-    返回 (tensor, face_detected_bool)
-    针对训练集小图（48x48灰度）做了特殊兼容
-    """
     h, w = cv_img.shape[:2]
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-
-    # 如果图片本身就很小且接近正方形，大概率是训练集样本（48x48），直接缩放
-    # 条件：宽高均 ≤ 200px，且长宽比在 0.5~2.0 之间
-    # 处理方式与训练时完全一致：直接缩放到 48x48 → 归一化
     aspect_ratio = w / h if h > 0 else 1
     is_small_square = (h <= 200 and w <= 200 and 0.5 <= aspect_ratio <= 2.0)
     if is_small_square:
-        print(f"[Debug] 小图直通模式: {w}x{h}, 与训练预处理一致")
-        # 直接缩放到 48x48，不做任何增强，保持与训练时完全一致
         resized = cv2.resize(gray, (48, 48), interpolation=cv2.INTER_AREA)
         tensor = torch.tensor(resized, dtype=torch.float32).unsqueeze(0).unsqueeze(0) / 255.0
         tensor = (tensor - 0.5) / 0.5
-        return tensor, True  # 训练集样本默认包含人脸
-
-    # 正常大图走 Haar 人脸检测
-    faces = face_cascade.detectMultiScale(
-        gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48)
-    )
-
+        return tensor, True
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
     if len(faces) > 0:
         x, y, fw, fh = max(faces, key=lambda r: r[2] * r[3])
         pad = int(max(fw, fh) * 0.15)
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(gray.shape[1], x + fw + pad)
-        y2 = min(gray.shape[0], y + fh + pad)
+        x1, y1 = max(0, x - pad), max(0, y - pad)
+        x2, y2 = min(w, x + fw + pad), min(h, y + fh + pad)
         face = gray[y1:y2, x1:x2]
         face_detected = True
     else:
-        # 没检测到人脸：尝试降低阈值再检一次
-        faces = face_cascade.detectMultiScale(
-            gray, scaleFactor=1.2, minNeighbors=3, minSize=(30, 30)
-        )
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=3, minSize=(30, 30))
         if len(faces) > 0:
             x, y, fw, fh = max(faces, key=lambda r: r[2] * r[3])
             pad = int(max(fw, fh) * 0.15)
-            x1 = max(0, x - pad)
-            y1 = max(0, y - pad)
-            x2 = min(gray.shape[1], x + fw + pad)
-            y2 = min(gray.shape[0], y + fh + pad)
+            x1, y1 = max(0, x - pad), max(0, y - pad)
+            x2, y2 = min(w, x + fw + pad), min(h, y + fh + pad)
             face = gray[y1:y2, x1:x2]
             face_detected = True
         else:
-            # 仍然没检测到，取图像中心区域作为 fallback
             center_crop = min(h, w)
-            y1 = (h - center_crop) // 2
-            x1 = (w - center_crop) // 2
+            y1, x1 = (h - center_crop) // 2, (w - center_crop) // 2
             face = gray[y1:y1+center_crop, x1:x1+center_crop]
             face_detected = False
-
     resized = cv2.resize(face, (48, 48))
-    # 调试：打印裁剪后灰度图的统计
-    print(f"[Debug] face crop stats: min={resized.min()}, max={resized.max()}, mean={resized.mean():.1f}, std={resized.std():.1f}")
     tensor = torch.tensor(resized, dtype=torch.float32).unsqueeze(0).unsqueeze(0) / 255.0
-    tensor = (tensor - 0.5) / 0.5  # Normalize(mean=0.5, std=0.5)
-    print(f"[Debug] tensor stats: mean={tensor.mean():.3f}, std={tensor.std():.3f}")
+    tensor = (tensor - 0.5) / 0.5
     return tensor, face_detected
 
-
+# ── 情绪识别 ────────────────────────────────────────────────────
 @app.route('/predict', methods=['POST'])
 def predict():
     if 'image' not in request.files:
         return jsonify({'error': 'No image field named "image"'}), 400
-
-    # 读取模型选择参数，默认用 SimpleCNN
     model_name = request.form.get('model', 'simple')
     if model_name not in models:
         model_name = 'simple'
     selected_model = models[model_name]
-
     try:
         raw_bytes = request.files['image'].read()
-        print(f"[Debug] 收到图片大小: {len(raw_bytes)/1024:.1f} KB, 模型: {model_name}")
-        pil_img = Image.open(io.BytesIO(raw_bytes))
-        pil_img = pil_img.convert('RGB')
-        orig_w, orig_h = pil_img.size
-        max_side = 800
-        if max(pil_img.size) > max_side:
-            ratio = max_side / max(pil_img.size)
-            new_w = int(pil_img.width * ratio)
-            new_h = int(pil_img.height * ratio)
-            pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
-            print(f"[Debug] 图片缩放: {orig_w}x{orig_h} -> {new_w}x{new_h}")
+        print(f"[Debug] image: {len(raw_bytes)/1024:.1f} KB, model: {model_name}")
+        pil_img = Image.open(io.BytesIO(raw_bytes)).convert('RGB')
+        if max(pil_img.size) > 800:
+            ratio = 800 / max(pil_img.size)
+            pil_img = pil_img.resize((int(pil_img.width*ratio), int(pil_img.height*ratio)), Image.LANCZOS)
         cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     except Exception as e:
         return jsonify({'error': f'Image read error: {str(e)}'}), 400
-
     tensor, face_detected = preprocess_image(cv_img)
-
     with torch.no_grad():
-        logits = selected_model(tensor)
-        probs = torch.softmax(logits, dim=1).squeeze().tolist()
-
+        probs = torch.softmax(selected_model(tensor), dim=1).squeeze().tolist()
     all_scores = {CLASS_LABELS[i]: round(float(probs[i]), 4) for i in range(8)}
     best_label = CLASS_LABELS[int(np.argmax(probs))]
     confidence = float(max(probs))
-
-    print(f"[Predict] [{model_name}] {best_label} ({confidence:.2%}) | face={face_detected}")
-
+    print(f"[Predict] [{model_name}] {best_label} ({confidence:.2%})")
     return jsonify({
-        'emotion': best_label,
-        'confidence': round(confidence, 4),
-        'all_scores': all_scores,
-        'face_detected': face_detected,
-        'model': model_name,
-        'is_mock': False
+        'emotion': best_label, 'confidence': round(confidence, 4),
+        'all_scores': all_scores, 'face_detected': face_detected,
+        'model': model_name, 'is_mock': False
     })
 
+# ── 日记保存 ────────────────────────────────────────────────────
+@app.route('/diary/save', methods=['POST'])
+def diary_save():
+    data = request.get_json()
+    user_id = data.get('user_id', 'default')
+    emotion = data.get('emotion', '')
+    confidence = data.get('confidence', 0)
+    all_scores = json.dumps(data.get('all_scores', {}))
+    note = data.get('note', '')
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    if not emotion:
+        return jsonify({'error': 'emotion is required'}), 400
+    db = get_db()
+    db.execute('''INSERT OR REPLACE INTO diary (user_id, date, emotion, confidence, all_scores, note)
+                  VALUES (?, ?, ?, ?, ?, ?)''',
+               (user_id, date_str, emotion, confidence, all_scores, note))
+    db.commit()
+    return jsonify({'status': 'ok', 'date': date_str, 'emotion': emotion})
 
+# ── 日记列表（某月）──────────────────────────────────────────────
+@app.route('/diary/list', methods=['GET'])
+def diary_list():
+    user_id = request.args.get('user_id', 'default')
+    year = request.args.get('year', str(datetime.now().year))
+    month = request.args.get('month', str(datetime.now().month))
+    db = get_db()
+    rows = db.execute(
+        'SELECT date, emotion, confidence, note FROM diary WHERE user_id=? AND strftime("%Y", date)=? AND strftime("%m", date)=? ORDER BY date',
+        (user_id, year.zfill(4), month.zfill(2))
+    ).fetchall()
+    records = [dict(r) for r in rows]
+    for r in records:
+        r['confidence'] = round(r['confidence'], 4)
+    return jsonify({'records': records, 'count': len(records)})
+
+# ── 每周报告 ────────────────────────────────────────────────────
+@app.route('/diary/weekly', methods=['GET'])
+def diary_weekly():
+    user_id = request.args.get('user_id', 'default')
+    today = datetime.now()
+    monday = today - timedelta(days=today.weekday())
+    db = get_db()
+    rows = db.execute(
+        'SELECT date, emotion, confidence, all_scores FROM diary WHERE user_id=? AND date BETWEEN ? AND ? ORDER BY date',
+        (user_id, monday.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d'))
+    ).fetchall()
+    if not rows:
+        return jsonify({'message': '本周暂无记录', 'days': 0, 'emotions': {}})
+    emotion_count = {}
+    total_confidence = 0
+    for r in rows:
+        e = r['emotion']
+        emotion_count[e] = emotion_count.get(e, 0) + 1
+        total_confidence += r['confidence']
+    trend = 'stable'
+    if len(rows) >= 2:
+        first_half = [r['emotion'] for r in rows[:len(rows)//2]]
+        second_half = [r['emotion'] for r in rows[len(rows)//2:]]
+        positive = {'happy', 'surprise'}
+        negative = {'anger', 'sad', 'fear', 'disgust'}
+        def score(emotions):
+            return sum(1 for e in emotions if e in positive) - sum(1 for e in emotions if e in negative)
+        s1, s2 = score(first_half), score(second_half)
+        if s2 > s1: trend = 'up'
+        elif s2 < s1: trend = 'down'
+    return jsonify({
+        'days': len(rows),
+        'emotions': {k: {'count': v, 'pct': round(v/len(rows)*100, 1)} for k, v in sorted(emotion_count.items(), key=lambda x: -x[1])},
+        'dominant': max(emotion_count, key=emotion_count.get),
+        'avg_confidence': round(total_confidence / len(rows), 4),
+        'trend': trend,
+        'streak': len(rows)
+    })
+
+# ── 健康检查 ────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'model': 'SimpleCNN-FER8', 'mock': False})
-
+    return jsonify({'status': 'ok', 'models': list(models.keys())})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
