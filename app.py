@@ -167,7 +167,8 @@ def diary_save():
     confidence = data.get('confidence', 0)
     all_scores = json.dumps(data.get('all_scores', {}))
     note = data.get('note', '')
-    date_str = datetime.now().strftime('%Y-%m-%d')
+    # 支持补签：前端可传指定日期，否则默认今天
+    date_str = data.get('date', datetime.now().strftime('%Y-%m-%d'))
     if not emotion:
         return jsonify({'error': 'emotion is required'}), 400
     db = get_db()
@@ -197,15 +198,21 @@ def diary_list():
 @app.route('/diary/weekly', methods=['GET'])
 def diary_weekly():
     user_id = request.args.get('user_id', 'default')
-    today = datetime.now()
-    monday = today - timedelta(days=today.weekday())
+    # 支持指定周的起始日期，默认本周一
+    week_start_str = request.args.get('week_start', '')
+    if week_start_str:
+        monday = datetime.strptime(week_start_str, '%Y-%m-%d')
+    else:
+        today = datetime.now()
+        monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
     db = get_db()
     rows = db.execute(
         'SELECT date, emotion, confidence, all_scores FROM diary WHERE user_id=? AND date BETWEEN ? AND ? ORDER BY date',
-        (user_id, monday.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d'))
+        (user_id, monday.strftime('%Y-%m-%d'), sunday.strftime('%Y-%m-%d'))
     ).fetchall()
     if not rows:
-        return jsonify({'message': '本周暂无记录', 'days': 0, 'emotions': {}})
+        return jsonify({'message': '本周暂无记录', 'days': 0, 'emotions': {}, 'week_start': monday.strftime('%Y-%m-%d')})
     emotion_count = {}
     total_confidence = 0
     for r in rows:
