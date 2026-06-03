@@ -230,13 +230,65 @@ def diary_weekly():
         s1, s2 = score(first_half), score(second_half)
         if s2 > s1: trend = 'up'
         elif s2 < s1: trend = 'down'
+    # 生成文字总结
+    EMO_CN = {'happy': '开心', 'sad': '悲伤', 'neutral': '平静', 'surprise': '惊讶',
+              'fear': '恐惧', 'disgust': '厌恶', 'anger': '愤怒', 'contempt': '轻蔑'}
+    
+    dominant = max(emotion_count, key=emotion_count.get)
+    dominant_days = emotion_count[dominant]
+    high_mood = [k for k in positive if emotion_count.get(k, 0) > 0]
+    low_mood = [k for k in negative if emotion_count.get(k, 0) > 0]
+    
+    # 主旨语句
+    summary_lines = []
+    if dominant in positive:
+        summary_lines.append(f"这一周你大部分时间感到{EMO_CN[dominant]}，整体情绪比较积极。")
+    elif dominant in negative:
+        summary_lines.append(f"这周你的{EMO_CN[dominant]}情绪占据了主导，可能需要关注一下自己的状态。")
+    else:
+        summary_lines.append(f"这周你的情绪以{EMO_CN[dominant]}为主，心态比较稳定。")
+    
+    # 趋势分析
+    if trend == 'up':
+        summary_lines.append("情绪呈上升趋势，后半周比前半周更积极。")
+    elif trend == 'down':
+        summary_lines.append("情绪略有下滑，后半周不如前半周开心。")
+    else:
+        summary_lines.append("整周情绪波动不大，保持得比较平稳。")
+    
+    # 多样性
+    unique_emotions = len(emotion_count)
+    if unique_emotions <= 2:
+        summary_lines.append("情绪种类不多，生活比较规律。")
+    elif unique_emotions <= 4:
+        summary_lines.append("这周经历了几种不同的心情，生活挺丰富的。")
+    else:
+        summary_lines.append("这一周情绪起伏很大，经历了很多不同的感受。")
+    
+    # 连签鼓励
+    streak = len(rows)
+    if streak >= 7:
+        summary_lines.append("全勤打卡！坚持记录情绪是了解自己的第一步。")
+    elif streak >= 5:
+        summary_lines.append(f"打卡了{streak}天，快接近满勤了，继续加油！")
+    else:
+        summary_lines.append(f"这周打卡{streak}天，下周可以更规律一些。")
+    
+    # 每日描述
+    day_summaries = []
+    for r in rows:
+        day_summaries.append({'date': r['date'], 'emotion': r['emotion'], 'emoji_cn': EMO_CN.get(r['emotion'], '')})
+    
     return jsonify({
         'days': len(rows),
         'emotions': {k: {'count': v, 'pct': round(v/len(rows)*100, 1)} for k, v in sorted(emotion_count.items(), key=lambda x: -x[1])},
-        'dominant': max(emotion_count, key=emotion_count.get),
+        'dominant': dominant,
         'avg_confidence': round(total_confidence / len(rows), 4),
         'trend': trend,
-        'streak': len(rows)
+        'streak': streak,
+        'summary': '\n'.join(summary_lines),
+        'summary_lines': summary_lines,
+        'day_summaries': day_summaries
     })
 
 # ── 健康检查 ────────────────────────────────────────────────────
